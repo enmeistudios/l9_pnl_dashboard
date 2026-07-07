@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html><head><title>gviz Debug</title></head>
+<body style="font-family:monospace;padding:20px">
+<h2>gviz Debug Test</h2>
+<p>Paste your Sheet ID and click Test to see raw gviz data</p>
+<input id="sid" placeholder="Sheet ID" style="width:400px;padding:8px">
+<button onclick="test()">Test</button>
+<pre id="out" style="background:#f5f5f5;padding:20px;margin-top:20px;overflow:auto;max-height:600px"></pre>
+<script>
+async function test() {
+  const sid = document.getElementById('sid').value.trim();
+  const out = document.getElementById('out');
+  
+  // Test with headers=0
+  const url = `https://docs.google.com/spreadsheets/d/${sid}/gviz/tq?tqx=out:json&headers=0&sheet=Enmei_Chelsea`;
+  out.textContent = 'Fetching: ' + url + '\n\n';
+  
+  try {
+    const res = await fetch(url);
+    const text = await res.text();
+    const match = text.match(/google\.visualization\.Query\.setResponse\(([\s\S]*)\)/);
+    if (!match) { out.textContent += 'BAD RESPONSE:\n' + text.slice(0,500); return; }
+    const table = JSON.parse(match[1]).table;
+    
+    out.textContent += `Total rows in gviz: ${table.rows.length}\n`;
+    out.textContent += `Total cols in gviz: ${table.cols.length}\n\n`;
+    
+    // Show first few cols
+    out.textContent += 'COLUMNS (gviz sees these as headers):\n';
+    table.cols.forEach((c,i) => {
+      out.textContent += `  col[${i}]: label="${c.label}" type=${c.type}\n`;
+    });
+    
+    out.textContent += '\nKEY ROWS (checking our row mappings):\n';
+    const checkRows = [
+      {sheetRow:19, label:'2025 gross_rev'},
+      {sheetRow:20, label:'2025 direct_rev'},
+      {sheetRow:61, label:'2026 direct_rev'},
+      {sheetRow:62, label:'2026 cp_rev'},
+      {sheetRow:73, label:'2026 salaries'},
+      {sheetRow:85, label:'2026 rent'},
+      {sheetRow:87, label:'2026 total_opex'},
+      {sheetRow:93, label:'2026 net_contrib'},
+    ];
+    checkRows.forEach(({sheetRow, label}) => {
+      const gvizIdx = sheetRow - 1;
+      const row = table.rows[gvizIdx];
+      const rowLabel = row?.c?.[0]?.v || '(empty)';
+      const janVal   = row?.c?.[2]?.v ?? 'NULL';
+      const febVal   = row?.c?.[3]?.v ?? 'NULL';
+      out.textContent += `  Sheet row ${sheetRow} (gviz[${gvizIdx}]) "${label}":\n`;
+      out.textContent += `    Row A label: "${rowLabel}"\n`;
+      out.textContent += `    Jan(col2)=${janVal}  Feb(col3)=${febVal}\n`;
+    });
+    
+  } catch(e) {
+    out.textContent += 'ERROR: ' + e.message;
+  }
+}
+</script>
+</body></html>
