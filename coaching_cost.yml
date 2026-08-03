@@ -1,0 +1,25 @@
+name: Actualize Coaching Cost
+
+on:
+  schedule:
+    # Runs at 06:00 UTC on the 1st of every month — adjust as needed
+    - cron: '0 6 1 * *'
+  workflow_dispatch: {}   # lets you also trigger it manually from the Actions tab
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pandas requests python-dateutil
+
+      - name: Run coaching cost actualization
+        env:
+          MARIANA_TEK_KEY: ${{ secrets.MARIANA_TEK_KEY }}
+        run: python scripts/actualize_coaching_cost.py
