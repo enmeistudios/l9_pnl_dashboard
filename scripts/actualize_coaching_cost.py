@@ -231,13 +231,23 @@ def append_new_rate_rows(existing_rates_df: pd.DataFrame, generated_rows_df: pd.
 
 
 
+def pull_taught_classes(month_start: str, month_end: str, max_pages: int = 50) -> pd.DataFrame:
     """
     month_start / month_end: 'YYYY-MM-DD' strings, inclusive.
     Pulls class_sessions and filters to classes that actually happened.
+
+    max_pages is a SAFETY CAP: the server-side date filter below is UNCONFIRMED
+    (I guessed the param names) — if the API silently ignores it, get_all()
+    would otherwise page through the studio's entire class history instead of
+    one month. 50 pages x 200 rows = 10,000 rows, comfortably more than a
+    single studio-month of classes should ever produce. If the log shows this
+    cap being hit, the date filter isn't working and needs fixing before
+    trusting the results.
     """
     df = get_all(
         "class_sessions",
         page_size=200,
+        max_pages=max_pages,
         filters={"start_date__gte": month_start, "start_date__lte": month_end},
     )
 
@@ -338,7 +348,24 @@ def actualize_coaching_cost(month_start: str, month_end: str, rates_df: pd.DataF
 
 
 # ────────────────────────────────────────────────────────────────
-# Example call
+# Entry point — runs when executed directly (python actualize_coaching_cost.py
+# or via the GitHub Actions workflow). Defaults to the previous full calendar
+# month, since that's the natural monthly cadence for this job.
 # ────────────────────────────────────────────────────────────────
-# rates_df = load_rates_from_sheet()  # set RATES_SHEET_ID above first
-# studio_costs, cotaught, unmatched = actualize_coaching_cost("2026-06-01", "2026-06-30", rates_df)
+if __name__ == "__main__":
+    import sys
+    import calendar
+
+    if len(sys.argv) == 3:
+        month_start, month_end = sys.argv[1], sys.argv[2]
+    else:
+        today = pd.Timestamp.today()
+        first_of_this_month = today.replace(day=1)
+        last_month_end = first_of_this_month - pd.Timedelta(days=1)
+        month_start = last_month_end.replace(day=1).strftime("%Y-%m-%d")
+        month_end = last_month_end.strftime("%Y-%m-%d")
+
+    print(f"Running for {month_start} to {month_end}")
+    rates_df = load_rates_from_sheet()
+    studio_costs, cotaught, unmatched = actualize_coaching_cost(month_start, month_end, rates_df)
+
