@@ -44,6 +44,19 @@ import pandas as pd
 # ────────────────────────────────────────────────────────────────
 RATES_SHEET_ID = "1PiacHBuqNHnJFQPiAv_ZK7HqCc1EMYU0RzeHBNAd72A"
 RATES_SHEET_GID = "1417395469"  # from the sheet's URL — more stable than a tab name
+ROSTER_SHEET_GID = "PASTE_YOUR_ROSTER_TAB_GID_HERE"  # add a 'Roster' tab: coach_name, employee_id, start_date
+
+# Apps Script Web App — set up once by following the setup steps, then paste
+# the URL and your chosen secret here (or via env vars, same pattern as
+# MARIANA_TEK_KEY, for the GitHub Actions version)
+SHEET_WRITE_URL = "https://script.google.com/macros/s/AKfycbwyYTsc_PGRkCpDjKvydgANpZvdyLxXE8Oq6eHNJNLMYVpVhhiBMGd8Qag7hUexeKzsKw/exec"
+
+try:
+    from google.colab import userdata
+    SHEET_WRITE_SECRET = userdata.get('SHEET_WRITE_SECRET')
+except ImportError:
+    import os
+    SHEET_WRITE_SECRET = os.environ.get('SHEET_WRITE_SECRET')
 
 
 def _parse_gviz_date(val):
@@ -56,26 +69,20 @@ def _parse_gviz_date(val):
     return val
 
 
-def load_rates_from_sheet(sheet_id: str = None, gid: str = None) -> pd.DataFrame:
+def _fetch_gviz_table(sheet_id: str, gid: str) -> pd.DataFrame:
     """
-    Reads the coach rates table straight from the published Google Sheet.
-    Returns a clean DataFrame: coach_name (str), effective_date (datetime),
-    rate_per_class (float) — ready to pass into actualize_coaching_cost().
+    Shared low-level fetch for any published-to-web Google Sheet tab.
+    Returns a raw DataFrame with lowercased, stripped column names —
+    callers validate their own required columns on top of this.
     """
-    sheet_id = sheet_id or RATES_SHEET_ID
-    gid = gid or RATES_SHEET_GID
-
-    if sheet_id == "PASTE_YOUR_RATES_SHEET_ID_HERE":
-        raise RuntimeError("Set RATES_SHEET_ID at the top of this file to your actual rates sheet ID.")
-
     url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:json&gid={gid}"
     resp = requests.get(url, timeout=30)
     text = resp.text
 
     if "accounts.google.com" in text or "ServiceLogin" in text:
         raise RuntimeError(
-            "Rates sheet isn't public yet. On that sheet: File -> Share -> Publish to web, "
-            "AND Share -> General access -> 'Anyone with the link' -> Viewer."
+            f"Sheet {sheet_id} (gid {gid}) isn't public yet. On that sheet: File -> Share -> "
+            "Publish to web, AND Share -> General access -> 'Anyone with the link' -> Viewer."
         )
 
     match = re.search(r"google\.visualization\.Query\.setResponse\((.*)\);?\s*$", text, re.S)
@@ -89,19 +96,88 @@ def load_rates_from_sheet(sheet_id: str = None, gid: str = None) -> pd.DataFrame
         row = [(cell.get("v") if cell else None) for cell in (r.get("c") or [])]
         rows.append(row)
     df = pd.DataFrame(rows, columns=cols)
-
-    # Normalize expected columns regardless of exact header casing/spacing
     df.columns = [str(c).strip().lower() for c in df.columns]
-    required = {"coach_name", "effective_date", "rate_per_class"}
+    return df
+
+
+def load_rates_from_sheet(sheet_id: str = None, gid: str = None) -> pd.DataFrame:
+    """
+    Reads the coach rates table straight from the published Google Sheet.
+    Returns: coach_name (str), employee_id (float), effective_date (datetime),
+    rate_per_class (float) — ready to pass into actualize_coaching_cost().
+    """
+    sheet_id = sheet_id or RATES_SHEET_ID
+    gid = gid or RATES_SHEET_GID
+
+    if sheet_id == "PASTE_YOUR_RATES_SHEET_ID_HERE":
+        raise RuntimeError("Set RATES_SHEET_ID at the top of this file to your actual rates sheet ID.")
+
+    df = _fetch_gviz_table(sheet_id, gid)
+
+    required = {"coach_name", "employee_id", "effective_date", "rate_per_class"}
     missing = required - set(df.columns)
     if missing:
         raise RuntimeError(f"Rates sheet is missing expected column(s): {missing}. Found: {list(df.columns)}")
 
     df["coach_name"] = df["coach_name"].astype(str).str.strip()
+    df["employee_id"] = pd.to_numeric(df["employee_id"], errors="coerce")
     df["effective_date"] = pd.to_datetime(df["effective_date"].apply(_parse_gviz_date))
     df["rate_per_class"] = pd.to_numeric(df["rate_per_class"], errors="coerce")
 
-    return df[["coach_name", "effective_date", "rate_per_class"]]
+    return df[["coach_name", "employee_id", "effective_date", "rate_per_class"]]
+
+
+def load_roster_from_sheet(sheet_id: str = None, gid: str = None) -> pd.DataFrame:
+    """
+    Reads a separate 'Roster' tab: coach_name, employee_id, start_date.
+    This is what build_tenure_rates() needs to know WHEN each coach started,
+    so it can compute which milestones they've crossed as of today.
+    New coaches only need adding here once — the automation takes it from there.
+    """
+    sheet_id = sheet_id or RATES_SHEET_ID
+    gid = gid or ROSTER_SHEET_GID
+
+    if gid == "PASTE_YOUR_ROSTER_TAB_GID_HERE":
+        raise RuntimeError("Set ROSTER_SHEET_GID at the top of this file to your roster tab's gid.")
+
+    df = _fetch_gviz_table(sheet_id, gid)
+
+    required = {"coach_name", "employee_id", "start_date"}
+    missing = required - set(df.columns)
+    if missing:
+        raise RuntimeError(f"Roster sheet is missing expected column(s): {missing}. Found: {list(df.columns)}")
+
+    df["coach_name"] = df["coach_name"].astype(str).str.strip()
+    df["employee_id"] = pd.to_numeric(df["employee_id"], errors="coerce")
+    df["start_date"] = pd.to_datetime(df["start_date"].apply(_parse_gviz_date))
+
+    return df[["coach_name", "employee_id", "start_date"]]
+
+
+def push_new_rate_rows(new_rows_df: pd.DataFrame, webapp_url: str, secret: str, sheet_name: str = None) -> dict:
+    """
+    Sends newly-due rate rows to the Apps Script Web App, which appends
+    them directly to the rates sheet. This is the ONLY function that
+    writes anything — everything else in this file only reads.
+
+    new_rows_df needs: coach_name, employee_id, effective_date, rate_per_class
+    """
+    if new_rows_df.empty:
+        print("No new rate rows to push — nothing due yet.")
+        return {"status": "ok", "added": 0}
+
+    rows = new_rows_df[["coach_name", "employee_id", "effective_date", "rate_per_class"]].values.tolist()
+    resp = requests.post(
+        webapp_url,
+        json={"secret": secret, "sheet_name": sheet_name or "Sheet1", "rows": rows},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    result = resp.json()
+    if "error" in result:
+        raise RuntimeError(f"Apps Script rejected the write: {result['error']}")
+    print(f"Pushed {result.get('added', 0)} new rate row(s) to the sheet.")
+    return result
 
 
 
@@ -172,6 +248,86 @@ def get_all(resource, page_size=100, max_pages=None, filters=None, max_retries=3
     return pd.DataFrame(all_records)
 
 
+def fetch_instructor_payroll(month_start: str, month_end: str, page_size: int = 2000,
+                              poll_interval: int = 2, max_wait: int = 60) -> pd.DataFrame:
+    """
+    Pulls the Instructor Payroll report (Mariana Tek report id 312) for the
+    given date range. Confirmed real param names from watching the actual
+    web UI network call: min_start_date_day / max_start_date_day (both
+    'YYYY-MM-DD' strings) — NOT start_date/end_date, which the API silently
+    ignores.
+
+    This is a 3-step ASYNC flow, confirmed by inspecting real browser
+    network calls:
+      1. GET async_table_report_data -> {"data": [{"id": job_id}]}
+      2. Poll GET async_table_report_data/job_status?id=job_id until status
+         == "complete" -> returns a signed, temporary s3_link
+      3. GET that s3_link directly (no auth headers needed — the signature
+         in the URL itself is the auth) to get the actual report data
+
+    Returns a DataFrame with the same columns as the exported CSV:
+    Class ID, Instructor Display Name(s), Instructor First Name(s),
+    Instructor Last Name(s), Employee ID, Is Substitute?, Class Date,
+    Class Time, Class Day Of Week, Location, Class Type, Class Category,
+    Class Name, Checked In Reservations, No Showed Reservations, Class Capacity
+    """
+    resp = requests.get(
+        f"{BASE_URL}/async_table_report_data",
+        headers=HEADERS,
+        params={
+            "id": 312,
+            "slug": "instructor-payroll",
+            "min_start_date_day": month_start,
+            "max_start_date_day": month_end,
+            "page_size": page_size,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    job_id = resp.json()["data"][0]["id"]
+
+    waited = 0
+    s3_link = None
+    while waited < max_wait:
+        status_resp = requests.get(f"{BASE_URL}/async_table_report_data/job_status", headers=HEADERS, params={"id": job_id}, timeout=30)
+        status_resp.raise_for_status()
+        status_data = status_resp.json()["data"]
+        if status_data["status"] == "complete":
+            s3_link = status_data["s3_link"]
+            break
+        if status_data["status"] == "failed":
+            raise RuntimeError(f"Instructor payroll report job {job_id} failed")
+        time.sleep(poll_interval)
+        waited += poll_interval
+
+    if s3_link is None:
+        raise TimeoutError(f"Instructor payroll report job {job_id} did not complete within {max_wait}s")
+
+    data_resp = requests.get(s3_link, timeout=30)
+    data_resp.raise_for_status()
+    payload = data_resp.json()
+
+    PAYROLL_COLUMNS = [
+        "class_id", "instructor_display_name", "instructor_first_name", "instructor_last_name",
+        "employee_id", "is_substitute", "class_date", "class_time", "class_day_of_week",
+        "location", "class_type", "class_category", "class_name",
+        "checked_in", "no_showed", "capacity",
+    ]
+
+    if isinstance(payload, list) and payload and isinstance(payload[0], list):
+        return pd.DataFrame(payload, columns=PAYROLL_COLUMNS)
+    if isinstance(payload, list):
+        return pd.DataFrame(payload)
+    if isinstance(payload, dict) and "rows" in payload:
+        cols = payload.get("columns") or payload.get("cols") or PAYROLL_COLUMNS
+        return pd.DataFrame(payload["rows"], columns=cols)
+    raise RuntimeError(
+        f"Unrecognized instructor payroll report shape: {type(payload)} "
+        f"keys={list(payload.keys()) if isinstance(payload, dict) else None}"
+    )
+
+
+
 def build_tenure_rates(coaches_df: pd.DataFrame, milestones: list, as_of=None) -> pd.DataFrame:
     """
     Generates coach_name | effective_date | rate_per_class rows for milestones
@@ -231,120 +387,121 @@ def append_new_rate_rows(existing_rates_df: pd.DataFrame, generated_rows_df: pd.
 
 
 
-def pull_taught_classes(month_start: str, month_end: str, max_pages: int = 50) -> pd.DataFrame:
+RECOVERY_BOOTS_EMPLOYEE_ID = 6733  # confirmed fixed ID for the equipment-booking pseudo-instructor
+
+
+def split_payroll_classes(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    month_start / month_end: 'YYYY-MM-DD' strings, inclusive.
-    Pulls class_sessions and filters to classes that actually happened.
-
-    max_pages is a SAFETY CAP: the server-side date filter below is UNCONFIRMED
-    (I guessed the param names) — if the API silently ignores it, get_all()
-    would otherwise page through the studio's entire class history instead of
-    one month. 50 pages x 200 rows = 10,000 rows, comfortably more than a
-    single studio-month of classes should ever produce. If the log shows this
-    cap being hit, the date filter isn't working and needs fixing before
-    trusting the results.
+    Takes the raw instructor payroll report and splits it into:
+      - real: actual coached classes, ready for rate matching
+      - unassigned: no instructor was ever assigned (employee_id is blank)
+      - cotaught: two+ rows share the same class_id — genuinely co-taught,
+        needs a human pay-split decision, not auto-calculated
+    Recovery Boots (employee_id 6733) is dropped entirely here — it's an
+    equipment booking, not a coached class.
     """
-    df = get_all(
-        "class_sessions",
-        page_size=200,
-        max_pages=max_pages,
-        filters={"start_date__gte": month_start, "start_date__lte": month_end},
-    )
+    df = df[df["employee_id"] != RECOVERY_BOOTS_EMPLOYEE_ID].copy()
 
-    if df.empty:
-        return df
+    unassigned = df[df["employee_id"].isna()].copy()
+    assigned = df[df["employee_id"].notna()].copy()
 
-    df["start_date"] = pd.to_datetime(df["start_date"])
+    dupe_class_ids = assigned["class_id"][assigned["class_id"].duplicated(keep=False)].unique()
+    cotaught = assigned[assigned["class_id"].isin(dupe_class_ids)].copy()
+    real = assigned[~assigned["class_id"].isin(dupe_class_ids)].copy()
 
-    # Defensive client-side filter too, in case the server-side filter keys
-    # above don't match what the API actually accepts — confirm on first run
-    # by checking len(df) and the min/max of start_date printed below.
-    df = df[
-        (df["start_date"] >= pd.to_datetime(month_start))
-        & (df["start_date"] <= pd.to_datetime(month_end))
-    ]
-
-    # A class that was cancelled or archived didn't actually get taught
-    df = df[df["cancellation_datetime"].isna()]
-    df = df[df["archived_at"].isna()]
-
-    print(f"Pulled {len(df)} taught class sessions "
-          f"({df['start_date'].min()} to {df['start_date'].max()})")
-
-    return df
+    return real, unassigned, cotaught
 
 
-def split_cotaught(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def attach_rates_by_employee(df: pd.DataFrame, rates_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Returns (single_instructor_df, cotaught_df).
-    Co-taught classes (instructor_names has != 1 entry) are pulled out and
-    NOT included in the cost calc — flagged for manual review instead.
-    """
-    is_single = df["instructor_names"].apply(lambda x: isinstance(x, list) and len(x) == 1)
-    single = df[is_single].copy()
-    single["instructor"] = single["instructor_names"].apply(lambda x: x[0])
-
-    cotaught = df[~is_single].copy()
-    return single, cotaught
-
-
-def attach_rates(df: pd.DataFrame, rates_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    rates_df columns required: coach_name, effective_date, rate_per_class
-    Looks up the rate in effect on each class's date (most recent
-    effective_date <= class date). Rows with no matching rate are pulled
-    out into unmatched_df rather than silently costed at 0.
+    rates_df columns required: employee_id, effective_date, rate_per_class
+    Matching on employee_id instead of name sidesteps every spelling
+    mismatch (Bromley/Bromey, Vicary-Smith/Vicary Smith, etc.) found during
+    real testing — employee_id is a stable numeric identifier, names aren't.
     """
     rates_df = rates_df.copy()
+    rates_df["employee_id"] = pd.to_numeric(rates_df["employee_id"], errors="coerce")
     rates_df["effective_date"] = pd.to_datetime(rates_df["effective_date"])
-    rates_df = rates_df.sort_values(["coach_name", "effective_date"])
+    rates_df = rates_df.sort_values(["employee_id", "effective_date"])
+
+    df = df.copy()
+    df["class_date"] = pd.to_datetime(df["class_date"])
 
     def lookup_rate(row):
         applicable = rates_df[
-            (rates_df["coach_name"] == row["instructor"])
-            & (rates_df["effective_date"] <= row["start_date"])
+            (rates_df["employee_id"] == row["employee_id"])
+            & (rates_df["effective_date"] <= row["class_date"])
         ]
         if applicable.empty:
             return None
         return applicable.iloc[-1]["rate_per_class"]
 
-    df = df.copy()
     df["rate"] = df.apply(lookup_rate, axis=1)
 
     matched = df[df["rate"].notna()].copy()
     unmatched = df[df["rate"].isna()].copy()
-
     matched["cost"] = matched["rate"]
     return matched, unmatched
 
 
-def summarize_by_studio(matched_df: pd.DataFrame) -> pd.DataFrame:
+def sync_rate_milestones(milestones: list, as_of=None) -> dict:
+    """
+    The full automation: reads the roster + current rates, figures out
+    which milestones are newly due, and pushes ONLY the new rows to the
+    sheet via the Apps Script Web App. Safe to run repeatedly (e.g. daily
+    or monthly via GitHub Actions) — never re-adds a row that's already
+    there, since it filters by (employee_id, effective_date) before pushing.
+    """
+    roster = load_roster_from_sheet()
+    current_rates = load_rates_from_sheet()
+
+    due_rows = build_tenure_rates(roster, milestones, as_of=as_of)
+    # build_tenure_rates() works off coach_name + start_date; attach employee_id
+    # back on afterward by joining through the roster
+    due_rows = due_rows.merge(roster[["coach_name", "employee_id"]], on="coach_name", how="left")
+
+    existing_keys = set(zip(current_rates["employee_id"], current_rates["effective_date"].dt.strftime("%Y-%m-%d")))
+    new_rows = due_rows[
+        ~due_rows.apply(lambda r: (r["employee_id"], r["effective_date"]) in existing_keys, axis=1)
+    ]
+
+    return push_new_rate_rows(new_rows, SHEET_WRITE_URL, SHEET_WRITE_SECRET)
+
+
+
     return (
-        matched_df.groupby("location_display")
-        .agg(classes_taught=("id", "count"), coaching_cost=("cost", "sum"))
+        matched_df.groupby("location")
+        .agg(classes_taught=("class_id", "count"), coaching_cost=("cost", "sum"))
         .reset_index()
-        .rename(columns={"location_display": "studio"})
+        .rename(columns={"location": "studio"})
     )
 
 
 def actualize_coaching_cost(month_start: str, month_end: str, rates_df: pd.DataFrame):
-    raw = pull_taught_classes(month_start, month_end)
-    single, cotaught = split_cotaught(raw)
-    matched, unmatched = attach_rates(single, rates_df)
+    raw = fetch_instructor_payroll(month_start, month_end)
+    print(f"Pulled {len(raw)} payroll rows ({raw['class_date'].min()} to {raw['class_date'].max()})")
+
+    real, unassigned, cotaught = split_payroll_classes(raw)
+    matched, unmatched = attach_rates_by_employee(real, rates_df)
     studio_costs = summarize_by_studio(matched)
 
     print("\n=== Actualized coaching cost by studio ===")
     print(studio_costs.to_string(index=False))
 
+    if len(unassigned):
+        print(f"\n[FLAG] {len(unassigned)} class(es) with NO instructor assigned — excluded, likely a scheduling gap:")
+        print(unassigned[["class_id", "class_date", "location", "class_type"]].to_string(index=False))
+
     if len(cotaught):
-        print(f"\n[FLAG] {len(cotaught)} co-taught class(es) excluded from cost — review manually:")
-        print(cotaught[["id", "start_date", "instructor_names", "location_display", "class_type_display"]].to_string(index=False))
+        print(f"\n[FLAG] {len(cotaught)} row(s) from genuinely co-taught classes — excluded, needs a pay-split decision:")
+        print(cotaught[["class_id", "class_date", "instructor_display_name", "employee_id", "location"]].to_string(index=False))
 
     if len(unmatched):
-        print(f"\n[FLAG] {len(unmatched)} class(es) with no matching rate — excluded, resolve and re-run:")
-        print(unmatched[["id", "start_date", "instructor", "location_display"]].to_string(index=False))
+        distinct = unmatched[["employee_id", "instructor_display_name"]].drop_duplicates()
+        print(f"\n[FLAG] {len(unmatched)} class(es) with no matching rate ({len(distinct)} distinct coach(es)) — excluded, resolve and re-run:")
+        print(distinct.to_string(index=False))
 
-    return studio_costs, cotaught, unmatched
+    return studio_costs, unassigned, cotaught, unmatched
 
 
 # ────────────────────────────────────────────────────────────────
@@ -367,5 +524,5 @@ if __name__ == "__main__":
 
     print(f"Running for {month_start} to {month_end}")
     rates_df = load_rates_from_sheet()
-    studio_costs, cotaught, unmatched = actualize_coaching_cost(month_start, month_end, rates_df)
+    studio_costs, unassigned, cotaught, unmatched = actualize_coaching_cost(month_start, month_end, rates_df)
 
